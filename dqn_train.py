@@ -38,7 +38,17 @@ HP_MATRIX = np.array([
     [ -1,  -2,   0,   0,   0,   0,   0,   0,   1],
     [  0,   0,   0,   0,   0,   0,   0,   0,   1],
 ], dtype=np.int32)
-
+HP_MATRIX_empty=np.array([
+    [  -2,  -3,  -3,  -1,  0,  0,  -1,  0,  -2],
+    [  -1,  -2,  -1,  -4,  0,  0,  -2,  0,  -3],
+    [  -1,  -3,  -2,  -4, -1,  0,  -3, -1,  +1],
+    [  -5,  -1,  -1,  -2, -3,  0,  -3, -3,  +1],
+    [  -2,  -2,  -1,  -1,  0,  0,   0,  0,  +1],
+    [  -2,  -2,  -2,  -2,  0,  0,   0,  0,  +1],
+    [   0,   0,   0,   0,  0,  0,   0,  0,  +1],
+    [  -3,  -4,  -1,  -1,  0,  0,   0,  0,  +1],
+    [  -1,  -1,  -2,  -2,  0,  0,   0,  0,  +1],
+], dtype=np.int32)
 ZERO_TABLE = np.array([
     [0,0,0,0,0,0,0,0,0],
     [0,0,0,0,0,0,0,0,0],
@@ -499,9 +509,14 @@ class HandGameEnv:
         if a_zero: self.pEn = 0; self.aEn = 0
 
         # HP_MATRIX
-        ai_dmg = int(HP_MATRIX[p_skill][a_skill])
-        p_dmg  = int(HP_MATRIX[a_skill][p_skill])
-        self.aHP += ai_dmg; self.pHP += p_dmg
+        p_dmg  = int(HP_MATRIX[p_skill][a_skill])   # → aHP
+        ai_dmg = int(HP_MATRIX[a_skill][p_skill])   # → pHP
+        if self.aEn == 0 and self.aHP + p_dmg > 0:
+            ai_dmg = int(HP_MATRIX_empty[a_skill][p_skill])
+        if self.pEn == 0 and self.pHP + ai_dmg > 0:
+            p_dmg  = int(HP_MATRIX_empty[p_skill][a_skill])
+        self.aHP += p_dmg
+        self.pHP += ai_dmg
         self.aHP = max(0, min(self.aHP, MAX_HP))
         self.pHP = max(0, min(self.pHP, MAX_HP))
         self.history.append((p_skill, a_skill))
@@ -511,18 +526,11 @@ class HandGameEnv:
             self.round += 1
             return self._get_state_features(), self._final_reward(self.round), True, self._info()
 
-        # 空城被动
-        pAtk = max(int(SKILL_ATK[p_skill]), 0)
-        aAtk = max(int(SKILL_ATK[a_skill]), 0)
-        self._resolve_passive(pAtk, aAtk)
-
-        pEn1 = self.pEn; aEn1 = self.aEn
-        pHP1 = self.pHP; aHP1 = self.aHP
-
-        self._check_over()
         if not self.over and self.round >= 30:
             self.over = True; self.winner = 3
 
+        pHP1 = self.pHP; aHP1 = self.aHP
+        pEn1 = self.pEn; aEn1 = self.aEn
         step_reward = self._calc_reward(pHP0, aHP0, pEn0, aEn0, p_skill, a_skill, p_zero, a_zero, pHP1, aHP1, pEn1, aEn1)
         done = self.over
         self.round += 1
@@ -563,8 +571,12 @@ class HandGameEnv:
         if p_zero: self.aEn = 0; self.pEn = 0
         if a_zero: self.pEn = 0; self.aEn = 0
 
-        ai_dmg = int(HP_MATRIX[p_skill][a_skill])
-        p_dmg  = int(HP_MATRIX[a_skill][p_skill])
+        ai_dmg = int(HP_MATRIX[p_skill][a_skill])   # → aHP
+        p_dmg  = int(HP_MATRIX[a_skill][p_skill])   # → pHP
+        if self.aEn == 0 and self.aHP + ai_dmg > 0:
+            p_dmg  = int(HP_MATRIX_empty[a_skill][p_skill])
+        if self.pEn == 0 and self.pHP + p_dmg > 0:
+            ai_dmg = int(HP_MATRIX_empty[p_skill][a_skill])
         self.aHP += ai_dmg; self.pHP += p_dmg
         self.aHP = max(0, min(self.aHP, MAX_HP))
         self.pHP = max(0, min(self.pHP, MAX_HP))
@@ -574,10 +586,6 @@ class HandGameEnv:
         if self.over:
             self.round += 1
             return self._get_state_features(), self._final_reward(self.round), True, self._info()
-
-        pAtk = max(int(SKILL_ATK[p_skill]), 0)
-        aAtk = max(int(SKILL_ATK[a_skill]), 0)
-        self._resolve_passive(pAtk, aAtk)
 
         self._check_over()
         if not self.over and self.round >= 30:

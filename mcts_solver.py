@@ -150,7 +150,7 @@ class MCTSSolver:
     """
 
     def __init__(self,
-                 start_hp:  int   = 3,
+                 start_hp:  int   = 4,
                  start_en:  int   = 2,
                  passive:   str   = 'empty_city',
                  c_puct:    float = 1.4,
