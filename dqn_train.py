@@ -511,9 +511,9 @@ class HandGameEnv:
         # HP_MATRIX
         p_dmg  = int(HP_MATRIX[p_skill][a_skill])   # → aHP
         ai_dmg = int(HP_MATRIX[a_skill][p_skill])   # → pHP
-        if self.aEn == 0 and self.aHP + p_dmg > 0:
+        if self.aEn == 0 and p_skill in (0, 1, 2, 3) and self.aHP + p_dmg > 0:
             ai_dmg = int(HP_MATRIX_empty[a_skill][p_skill])
-        if self.pEn == 0 and self.pHP + ai_dmg > 0:
+        if self.pEn == 0 and a_skill in (0, 1, 2, 3) and self.pHP + ai_dmg > 0:
             p_dmg  = int(HP_MATRIX_empty[p_skill][a_skill])
         self.aHP += p_dmg
         self.pHP += ai_dmg
@@ -573,9 +573,9 @@ class HandGameEnv:
 
         ai_dmg = int(HP_MATRIX[p_skill][a_skill])   # → aHP
         p_dmg  = int(HP_MATRIX[a_skill][p_skill])   # → pHP
-        if self.aEn == 0 and self.aHP + ai_dmg > 0:
+        if self.aEn == 0 and p_skill in (0, 1, 2, 3) and self.aHP + ai_dmg > 0:
             p_dmg  = int(HP_MATRIX_empty[a_skill][p_skill])
-        if self.pEn == 0 and self.pHP + p_dmg > 0:
+        if self.pEn == 0 and a_skill in (0, 1, 2, 3) and self.pHP + p_dmg > 0:
             ai_dmg = int(HP_MATRIX_empty[p_skill][a_skill])
         self.aHP += ai_dmg; self.pHP += p_dmg
         self.aHP = max(0, min(self.aHP, MAX_HP))

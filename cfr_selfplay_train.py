@@ -21,7 +21,7 @@ from dqn_train import (
 
 # ── 训练参数 ──────────────────────────────────────────────
 INIT_HP    = 4      # 起始血量
-INIT_EN    = 0     # 起始能量
+INIT_EN    = 2     # 起始能量
 MAX_ROUNDS = 30
 GAMMA      = 0.99   # 折现率
 BLEND_STEPS = 5     # 终局信号混合窗口
@@ -55,9 +55,9 @@ COUNTER_CHAIN = [
     (0, 1, "单枪>双枪",    1, 2),
     (0, 2, "单枪>三枪",    1, 2),
     # 能量效率克制（无直接伤害，靠能量经济差）
-    (6, 5, "能量>大防",    0, 1),   # 能量+1能 vs 大防-1能，净差+2
-    (6, 7, "能量>反弹",    0, 1),   # 能量+1能 vs 反弹-1能，净差+2
-    (6, 4, "能量≥小防",   0, 0),   # 能量+1能 vs 小防±0能，净差+1（部分）
+    (6, 5, "能量>大防",    0, 1),   # 能量+1能 vs 大防-1能，净差+2（强克制）
+    (6, 7, "能量>反弹",    0, 1),   # 能量+1能 vs 反弹-1能，净差+2（强克制）
+    (6, 4, "能量≥小防",    0, 0),   # 能量+1能 vs 小防±0能，净差+1（同单枪>双枪/三枪）
 ]
 
 # 显式克制优势矩阵
@@ -88,41 +88,41 @@ COUNTER_ADV += (_net_en[:, None] - _net_en[None, :]) * ENERGY_HP_VALUE
 # 当守方使用2费技能（双枪/三枪）恰好降至0能量时，空城被动对攻方造成1点反伤，
 # 抵消 HP_MATRIX 里的1点优势。起始能量=2是标准场景，此时HP优势=0，实际收益≈1能量单位。
 # 因此从 COUNTER_ADV 中减去被空城抵消的HP分量，使 单枪>双枪/三枪 = 0.35（纯能量效率）。
-COUNTER_ADV[0][1] -= 1.0   # 单枪 vs 双枪
-COUNTER_ADV[0][2] -= 1.0   # 单枪 vs 三枪
+COUNTER_ADV[0][1] -= 1.0   # 单枪 vs 双枪（P1攻 P2守）
+COUNTER_ADV[0][2] -= 1.0   # 单枪 vs 三枪（P1攻 P2守）
+# 对称项：P2出单枪 P1守双枪/三枪时同样触发空城，从P1视角看是劣势增加（+1给对手）
+COUNTER_ADV[1][0] += 1.0   # 双枪 vs 单枪（P1攻 P2守）
+COUNTER_ADV[2][0] += 1.0   # 三枪 vs 单枪（P1攻 P2守）
 
-# 预计算零费技能（空城时唯一可出的技能）
+# 0费技能列表：能量为0时的合法选项（与空城触发无关；空城触发条件是本回合结算后能量归零）
 _ZERO_COST = [s for s in range(NUM_SKILLS) if SKILL_COST[s] == 0]
 
 
 def _danger_signal(pHP, pEn, a_legal):
     """
-    P1 无能量时, 对手下回合对 P1 的最大致命威胁, 返回 ∈ [-2, 0]。
-    -2 = 对手必然能重创/秒杀; 0 = 对手无法造成有效伤害。
+    P1 进入空城的威胁评估，返回 ∈ [-2, 0]。
+    -2 = 对手必然能重创/秒杀; 0 = 无危险。
 
-    P1 无能量只能出 0 费技能：
-      - 技能 6（能量）：使 P1 能量变 1，逃脱空城 → 用 HP_MATRIX
-      - 其他 0 费技能（小防等）：P1 仍在空城 → 用 HP_MATRIX_empty
-    对手技能全部枚举（不再依赖 SKILL_ATK 粗判断）。
+    scale = 本方合法行动中"花完能量归零"的占比（均匀策略假设），
+    动态反映空城触发概率，覆盖 en 0~3：
+      en=0: 小防/大防/反弹共3个归零，技能6逃脱 → 约3/4
+      en=1: 单枪1个归零，其余留能 → 约1/5
+      en=2: 双枪/三枪/清零共3个归零 → 约3/8
+      en=3: 大招1个归零 → 约1/9
+      en≥4: 忽略
     """
-    if pEn > 0 or not a_legal:
+    if pEn > 3 or not a_legal:
         return 0.0
-    max_dmg = 0
-    for a2 in a_legal:
-        for p1d in _ZERO_COST:
-            if p1d == 6:
-                # P1 打出能量技，能量变 1，不触发空城
-                d = max(0, -int(HP_MATRIX[a2][p1d]))
-            else:
-                # P1 仍在空城，用空城矩阵
-                d = max(0, -int(HP_MATRIX_empty[a2][p1d]))
-            if d > max_dmg:
-                max_dmg = d
+    scale = _DANGER_SCALE[pEn]
+    if scale == 0.0:
+        return 0.0
+    max_dmg = float(_MAX_DMG_VS_ZERO[a_legal].max())
     if max_dmg == 0:
         return 0.0
     lethality = min(max_dmg / max(pHP, 0.5), 2.0)
     urgency = max(0.0, 1.0 - (pHP - 1) / max(MAX_HP - 1, 1))
-    return -lethality * (0.5 + 0.5 * urgency)  # ∈ [-2, 0]
+    base = -lethality * (0.5 + 0.5 * urgency)
+    return base * scale
 
 
 # ── 可学习启发参数 ──────────────────────────────────────────
@@ -151,8 +151,10 @@ class HeuristicParams:
             [0.48, 0.26, 0.10,  0.40],  # phase 2: 高能
         ], dtype=np.float64)
 
-    def eval(self, pHP, pEn, aHP, aEn, p_legal, a_legal):
-        """计算 P1 视角启发值, 包含危险惩罚"""
+    def eval(self, pHP, pEn, aHP, aEn, p_legal, a_legal, opp_sg=None, p1_sg=None):
+        """计算 P1 视角启发值, 包含危险惩罚。
+        opp_sg: P2 平均策略；p1_sg: P1 平均策略。
+        双方均有时按联合分布期望计算 counter；仅对手有时 P1 取 max；均无时 worst-case min。"""
         if pHP <= 0: return -1.0
         if aHP <= 0: return  1.0
 
@@ -163,20 +165,32 @@ class HeuristicParams:
 
         counter = 0.0
         if p_legal and a_legal:
-            p1g = max(min(float(COUNTER_ADV[p][a]) for a in a_legal) for p in p_legal)
-            counter = float(np.clip(p1g, -MAX_HP, MAX_HP)) / MAX_HP
+            p_arr = np.array(p_legal, dtype=np.intp)
+            a_arr = np.array(a_legal, dtype=np.intp)
+            sub = COUNTER_ADV[p_arr[:, None], a_arr]  # (|p|, |a|)
+            if opp_sg is not None and p1_sg is not None:
+                p1g = float(p1_sg[p_arr] @ sub @ opp_sg[a_arr])
+            elif opp_sg is not None:
+                p1g = float((sub @ opp_sg[a_arr]).max())
+            else:
+                p1g = float(sub.min(axis=1).max())
+            counter = max(-1.0, min(1.0, p1g / MAX_HP))
 
-        danger = _danger_signal(pHP, pEn, a_legal)  # ∈ [-2, 0]
+        # P1空城危险（负值）- P2空城危险（负值，对P1是收益取负号）= 净危险差
+        danger   = _danger_signal(pHP, pEn, a_legal)   # P1危险 ∈ [-2, 0]
+        p2_danger = _danger_signal(aHP, aEn, p_legal)  # P2危险 ∈ [-2, 0]，对P1是正收益
+        danger_net = danger - p2_danger                 # 对称：P1危险↓ P2危险↑
 
         extra = 0.0
         if ph == 1:
             extra = (0.08 if pEn >= 3 else 0.0) - (0.08 if aEn >= 3 else 0.0)
         elif ph == 2:
             extra = ((0.07 if pEn >= 3 else 0.0) - (0.07 if aEn >= 3 else 0.0)
-                     + (-0.06 if pEn == 0 and aEn > 0 else 0.0))
+                     + (-0.06 if pEn == 0 and aEn > 0 else 0.0)
+                     - (-0.06 if aEn == 0 and pEn > 0 else 0.0))  # 对称：P2在空城P1有优势
 
-        val = w[0]*hp_adv + w[1]*en_adv + w[2]*counter + w[3]*danger + extra
-        return float(np.clip(val, -1.5, 1.5))
+        val = w[0]*hp_adv + w[1]*en_adv + w[2]*counter + w[3]*danger_net + extra
+        return max(-1.5, min(1.5, val))
 
     def update_episode(self, records, final_v):
         """
@@ -197,15 +211,22 @@ class HeuristicParams:
             w[0] = float(np.clip(w[0] + self.LR * error * hp_adv,  0.10, 1.50))
             w[1] = float(np.clip(w[1] + self.LR * error * en_adv,  0.00, 0.80))
 
-            # 危险权重: 仅在濒死+无能量状态下更新, 且使用更高学习率
-            if pEn == 0 and pHP <= 2:
-                danger = _danger_signal(pHP, pEn, a_legal)
-                if danger < -0.01:
-                    # danger ∈ (-2, 0), error < 0 (预测太乐观) → 增大危险惩罚
-                    w[3] = float(np.clip(
-                        w[3] - self.LR_DANGER * error * (-danger),
-                        0.00, 2.50
-                    ))
+            # 危险权重: en≤3 均可能触发空城，使用更高学习率
+            danger = _danger_signal(pHP, pEn, a_legal)
+            if danger < -0.01:
+                # danger ∈ (-2, 0), error < 0 (预测太乐观) → 增大危险惩罚
+                w[3] = float(np.clip(
+                    w[3] - self.LR_DANGER * error * (-danger),
+                    0.00, 2.50
+                ))
+
+            # 克制权重: 让学习决定克制对局面的影响程度
+            p_legal = legal_actions(pEn)
+            if p_legal and a_legal:
+                p1g = max(min(float(COUNTER_ADV[p][a]) for a in a_legal) for p in p_legal)
+                counter = float(np.clip(p1g, -MAX_HP, MAX_HP)) / MAX_HP
+                if abs(counter) > 0.01:
+                    w[2] = float(np.clip(w[2] + self.LR * error * counter, 0.00, 0.50))
 
     def weights_str(self):
         lines = []
@@ -238,6 +259,24 @@ def legal_actions(en):
     acts = [s for s in range(NUM_SKILLS) if SKILL_COST[s] <= en]
     return acts if acts else [6]
 
+# 预计算各能量等级合法行动 & 空城触发概率，避免热路径反复构造列表
+_LEGAL_AT_EN = [legal_actions(en) for en in range(MAX_ENERGY + 1)]
+_DANGER_SCALE = []
+for _en in range(MAX_ENERGY + 1):
+    _pl = _LEGAL_AT_EN[_en]
+    _drain = sum(1 for _s in _pl if SKILL_COST[_s] == _en and _s != 6)
+    _DANGER_SCALE.append(_drain / len(_pl) if _pl else 0.0)
+
+# 预计算每个技能 a2 对空城方造成的最大伤害（消掉 _danger_signal 内双层循环）
+_MAX_DMG_VS_ZERO = np.zeros(NUM_SKILLS, dtype=np.float32)
+for _a2 in range(NUM_SKILLS):
+    _md = 0
+    for _p1d in _ZERO_COST:
+        _d = max(0, -int(HP_MATRIX[_a2][_p1d] if _p1d == 6 else HP_MATRIX_empty[_a2][_p1d]))
+        if _d > _md:
+            _md = _d
+    _MAX_DMG_VS_ZERO[_a2] = _md
+
 
 def game_step(pHP, pEn, aHP, aEn, pSk, aSk):
     """单步结算，返回 (pHP', pEn', aHP', aEn', done, winner)"""
@@ -255,10 +294,10 @@ def game_step(pHP, pEn, aHP, aEn, pSk, aSk):
     if pHP2 <= 0 or aHP2 <= 0:
         return pHP2, pEn2, aHP2, aEn2, True, _winner(pHP2, aHP2)
 
-    # 空城被动：对方能量为0且未被击杀，改用空城矩阵
-    if aEn2 == 0:
+    # 空城被动：对方能量为0 且 攻方出攻击技能(0-3)，改用空城矩阵
+    if aEn2 == 0 and pSk in (0, 1, 2, 3) and aHP + p_dmg > 0:
         ai_dmg = int(HP_MATRIX_empty[aSk][pSk])
-    if pEn2 == 0 and pHP + ai_dmg > 0:
+    if pEn2 == 0 and aSk in (0, 1, 2, 3) and pHP + ai_dmg > 0:
         p_dmg  = int(HP_MATRIX_empty[pSk][aSk])
 
     aHP2 = max(0, min(MAX_HP, aHP + p_dmg))
@@ -281,21 +320,20 @@ def terminal_value(winner, pHP, aHP):
     return 0.0
 
 
-def heuristic_value(pHP, pEn, aHP, aEn, p_legal=None, a_legal=None, params=None):
+def heuristic_value(pHP, pEn, aHP, aEn, p_legal=None, a_legal=None, params=None,
+                    opp_sg=None, p1_sg=None):
     """
     能量阶段感知的状态评估（P1 视角）
 
-    Phase 0 (空城): 能量为 0 的空城被动主导，HP 优势权重极高
-    Phase 1 (低能): 只有部分克制链可用，能量积累价值高
-    Phase 2 (高能): 完整克制链激活，相对能量优势决定战略主动权
-
     p_legal / a_legal: 双方在当前能量下的合法技能集合。
     params: HeuristicParams 实例，非 None 时使用可学习权重评估。
+    opp_sg / p1_sg: P2/P1 平均策略分布，用于对位优势期望值计算（双方均提供时最准确）。
     """
     if params is not None:
         return params.eval(pHP, pEn, aHP, aEn,
                            p_legal if p_legal is not None else [],
-                           a_legal if a_legal is not None else [])
+                           a_legal if a_legal is not None else [],
+                           opp_sg, p1_sg)
     if pHP <= 0: return -1.0
     if aHP <= 0: return  1.0
 
@@ -380,9 +418,8 @@ class CFRSolver:
 
     def average_strategy(self, player, sid, legal):
         """平均策略（Nash 均衡近似）"""
-        s = self.S[player][sid] * np.array(
-            [1.0 if a in set(legal) else 0.0 for a in range(NUM_SKILLS)]
-        )
+        s = np.zeros(NUM_SKILLS)
+        s[legal] = self.S[player][sid][legal]
         total = s.sum()
         if total > 1e-12:
             return s / total
@@ -390,18 +427,22 @@ class CFRSolver:
         mask[legal] = 1.0 / len(legal)
         return mask
 
-    def _next_value(self, nhp, nen, nahp, naen, g, final_v):
-        """非终局状态的价值估算（P1 视角）：heuristic 与终局信号混合。"""
+    def _next_value(self, nhp, nen, nahp, naen):
+        """非终局状态的价值估算（P1 视角）：纯启发值。
+        不注入采样终局信号——final_v 来自采样路径，对反事实 (alt,opp) 有偏。
+        对位优势按 P2 当前平均策略期望计算，让启发值随对手策略演化而动态调整。"""
         npl = legal_actions(nen)
         nal = legal_actions(naen)
-        imm = heuristic_value(nhp, nen, nahp, naen, npl, nal, self.h_params)
-        return (1 - g) * imm + g * final_v
+        ns = state_id(nhp, nen, nahp, naen)
+        p1_sg  = self.average_strategy(0, ns, npl)
+        opp_sg = self.average_strategy(1, ns, nal)
+        return heuristic_value(nhp, nen, nahp, naen, npl, nal, self.h_params, opp_sg, p1_sg)
 
-    def run_episode(self, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
-        """运行完整一局，收集轨迹并执行 CFR 遗憾更新"""
+    def run_episode(self, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN), epsilon=0.0):
+        """运行完整一局，收集轨迹并执行 CFR 遗憾更新。
+        epsilon: 采样时混入均匀探索的比例；CFR 遗憾更新始终用纯策略 sg，不污染收敛。"""
         pHP, pEn, aHP, aEn = init
         traj = []
-        h_records = []   # (pHP, pEn, aHP, aEn, a_legal, pred_v) for HeuristicParams
         done = False; winner = 3; rnd = 0
 
         while not done and rnd < MAX_ROUNDS:
@@ -411,40 +452,31 @@ class CFRSolver:
             l2 = legal_actions(aEn)
             sg1 = self.current_strategy(0, s, l1)
             sg2 = self.current_strategy(1, s, l2)
-            a1  = int(np.random.choice(NUM_SKILLS, p=sg1))
-            a2  = int(np.random.choice(NUM_SKILLS, p=sg2))
+            if epsilon > 0:
+                unif1 = np.zeros(NUM_SKILLS); unif1[l1] = 1.0 / len(l1)
+                unif2 = np.zeros(NUM_SKILLS); unif2[l2] = 1.0 / len(l2)
+                a1 = int(np.random.choice(NUM_SKILLS, p=(1-epsilon)*sg1 + epsilon*unif1))
+                a2 = int(np.random.choice(NUM_SKILLS, p=(1-epsilon)*sg2 + epsilon*unif2))
+            else:
+                a1 = int(np.random.choice(NUM_SKILLS, p=sg1))
+                a2 = int(np.random.choice(NUM_SKILLS, p=sg2))
             traj.append((s, l1, l2, sg1, sg2, a1, a2, pHP, pEn, aHP, aEn))
             self.phase_steps[energy_phase(pEn, aEn)] += 1
             pHP, pEn, aHP, aEn, done, winner = game_step(pHP, pEn, aHP, aEn, a1, a2)
 
-            # 记录实际后继状态的启发预测值，供 h_params 学习
-            if not done:
-                npl = legal_actions(pEn)
-                nal = legal_actions(aEn)
-                pred_v = heuristic_value(pHP, pEn, aHP, aEn, npl, nal, self.h_params)
-                h_records.append((pHP, pEn, aHP, aEn, nal, pred_v))
-
-        final_v = terminal_value(winner, pHP, aHP)
         T = len(traj)
         self.episode_count += 1
         self.total_steps   += T
 
         # ── 反向遍历轨迹，更新 CFR 遗憾 ───────────────────────
-        for t, (s, l1, l2, sg1, sg2, a1, a2, php, pen, ahp, aen) in enumerate(traj):
-            steps_to_end = T - t - 1
-            # gamma 越大 → 越依赖终局信号；越小 → 越依赖即时启发
-            g = GAMMA ** steps_to_end if steps_to_end < BLEND_STEPS else 0.0
-
-            # P1 反事实价值向量（external sampling + 一步展开，空城矩阵自动枚举）
+        for s, l1, l2, sg1, sg2, a1, a2, php, pen, ahp, aen in traj:
+            # P1 反事实价值向量（external sampling + 一步展开）
             cf1 = np.zeros(NUM_SKILLS)
             for alt in l1:
                 v = 0.0
                 for opp in l2:
                     nhp, nen, nahp, naen, d, w = game_step(php, pen, ahp, aen, alt, opp)
-                    if d:
-                        vi = terminal_value(w, nhp, nahp)
-                    else:
-                        vi = self._next_value(nhp, nen, nahp, naen, g, final_v)
+                    vi = terminal_value(w, nhp, nahp) if d else self._next_value(nhp, nen, nahp, naen)
                     v += sg2[opp] * vi
                 cf1[alt] = v
             ev1 = float(sg1 @ cf1)
@@ -455,10 +487,7 @@ class CFRSolver:
                 v = 0.0
                 for opp in l1:
                     nhp, nen, nahp, naen, d, w = game_step(php, pen, ahp, aen, opp, alt)
-                    if d:
-                        vi = -terminal_value(w, nhp, nahp)
-                    else:
-                        vi = -self._next_value(nhp, nen, nahp, naen, g, final_v)
+                    vi = -terminal_value(w, nhp, nahp) if d else -self._next_value(nhp, nen, nahp, naen)
                     v += sg1[opp] * vi
                 cf2[alt] = v
             ev2 = float(sg2 @ cf2)
@@ -473,10 +502,6 @@ class CFRSolver:
             weight = float(self.episode_count)
             self.S[0][s] += weight * sg1
             self.S[1][s] += weight * sg2
-
-        # ── 更新可学习启发参数 ────────────────────────────────
-        if h_records:
-            self.h_params.update_episode(h_records, final_v)
 
         # ── 克制链统计（仅在双方能量满足条件时才计入）───────────
         for _, _, _, _, _, a1, a2, php, pen, ahp, aen in traj:
@@ -512,26 +537,31 @@ def best_response_winrate(solver, player_br=2, n_eval=300,
             l1 = legal_actions(pEn)
             l2 = legal_actions(aEn)
 
-            # 固定方：用平均策略采样
+            # 固定方：平均策略分布（不采样，用于期望计算）
             fixed_sg = solver.average_strategy(fixed_player, s, l1 if fixed_player == 0 else l2)
-            fixed_a  = int(np.random.choice(NUM_SKILLS, p=fixed_sg))
+            opp_legal = l1 if fixed_player == 0 else l2
 
-            # BR 方：对固定方当前策略求贪心最佳响应（1步展开）
+            # BR 方：对固定方的策略分布求期望，选期望最高的动作（同步博弈，不能看对手的具体行动）
             br_legal = l2 if player_br == 2 else l1
+            sign = 1 if player_br == 1 else -1
             best_a = br_legal[0]; best_v = float('-inf')
             for alt in br_legal:
-                p1, a = (fixed_a, alt) if fixed_player == 0 else (alt, fixed_a)
-                nhp, nen, nahp, naen, d, w = game_step(pHP, pEn, aHP, aEn, p1, a)
-                if d:
-                    v = terminal_value(w, nhp, nahp) * (1 if player_br == 1 else -1)
-                else:
-                    next_p_legal = legal_actions(nen)
-                    next_a_legal = legal_actions(naen)
-                    v = heuristic_value(nhp, nen, nahp, naen, next_p_legal, next_a_legal,
-                                        solver.h_params) * (1 if player_br == 1 else -1)
-                if v > best_v:
-                    best_v = v; best_a = alt
+                ev = 0.0
+                for opp in opp_legal:
+                    p1, a = (opp, alt) if fixed_player == 0 else (alt, opp)
+                    nhp, nen, nahp, naen, d, w = game_step(pHP, pEn, aHP, aEn, p1, a)
+                    if d:
+                        vi = terminal_value(w, nhp, nahp) * sign
+                    else:
+                        npl = legal_actions(nen); nal = legal_actions(naen)
+                        vi = heuristic_value(nhp, nen, nahp, naen, npl, nal,
+                                             solver.h_params) * sign
+                    ev += fixed_sg[opp] * vi
+                if ev > best_v:
+                    best_v = ev; best_a = alt
 
+            # 固定方仍需采样一个动作以推进游戏状态
+            fixed_a = int(np.random.choice(NUM_SKILLS, p=fixed_sg))
             a1, a2 = (fixed_a, best_a) if fixed_player == 0 else (best_a, fixed_a)
             pHP, pEn, aHP, aEn, done, winner = game_step(pHP, pEn, aHP, aEn, a1, a2)
 
@@ -582,11 +612,17 @@ def analyze_nash(solver, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
     # ── Phase 2: 高能（3+能，完整克制链）─────────────────
     print(f"\n  === Phase 2: 高能区（完整克制链激活）===")
     phase2_states = [
+        (4, 3, 4, 3,      "高能对称 3能 满血"),
         (3, 3, 3, 3,      "高能对称 3能"),
         (2, 3, 2, 2,      "P1 大招就绪 vs P2 2能"),
         (2, 2, 2, 3,      "P2 大招就绪 vs P1 2能"),
         (1, 3, 2, 3,      "P1濒死双方高能"),
         (3, 3, 3, 1,      "P2低能 P1大招压制"),
+        (4, 4, 4, 4,      "超高能对称 4能"),
+        (3, 4, 3, 4,      "超高能对称 4能"),
+        (2, 4, 2, 3,      "P1 4能 vs P2 3能"),
+        (4, 5, 4, 5,      "极高能对称 5能"),
+        (3, 5, 3, 3,      "P1 5能 vs P2 3能"),
     ]
     for state in phase2_states:
         print_strategy(solver, *state[:4], state[4])
@@ -614,20 +650,36 @@ def analyze_nash(solver, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
 
 def save_strategy(solver, path=DEFAULT_SAVE_PATH):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ctr_keys = list(solver.counter_hits.keys())
+    ctr_vals = [solver.counter_hits[k] for k in ctr_keys]
     np.savez(path, R0=solver.R[0], R1=solver.R[1],
              S0=solver.S[0], S1=solver.S[1],
-             hw=solver.h_params.w)
+             hw=solver.h_params.w,
+             total_steps=np.array([solver.total_steps]),
+             episode_count=np.array([solver.episode_count]),
+             phase_steps=np.array(solver.phase_steps),
+             ctr_keys=np.array(ctr_keys, dtype=object),
+             ctr_vals=np.array(ctr_vals, dtype=np.int64))
     print(f"[保存] 策略 → {path}")
 
 
 def load_strategy(solver, path=DEFAULT_SAVE_PATH):
     if not os.path.exists(path):
         return False
-    d = np.load(path)
+    d = np.load(path, allow_pickle=True)
     solver.R[0][:] = d["R0"]; solver.R[1][:] = d["R1"]
     solver.S[0][:] = d["S0"]; solver.S[1][:] = d["S1"]
     if "hw" in d:
         solver.h_params.w[:] = d["hw"]
+    if "total_steps" in d:
+        solver.total_steps = int(d["total_steps"][0])
+    if "episode_count" in d:
+        solver.episode_count = int(d["episode_count"][0])
+    if "phase_steps" in d:
+        solver.phase_steps = list(d["phase_steps"].astype(int))
+    if "ctr_keys" in d and "ctr_vals" in d:
+        for k, v in zip(d["ctr_keys"], d["ctr_vals"]):
+            solver.counter_hits[str(k)] += int(v)
     print(f"[加载] 策略 ← {path}")
     return True
 
@@ -660,7 +712,9 @@ def train_cfr(
     log_data = []
 
     for it in range(1, n_iters + 1):
-        winner, rnd = solver.run_episode(init_state)
+        # ε 从 0.20 线性衰减到 0.02：早期多探索，后期收敛
+        epsilon = max(0.02, 0.20 * (1.0 - it / n_iters))
+        winner, rnd = solver.run_episode(init_state, epsilon=epsilon)
         wins[winner - 1] += 1
 
         if it % log_every == 0:
@@ -981,4 +1035,6 @@ if __name__ == "__main__":
         learn = not (len(sys.argv) > 3 and sys.argv[3] == "no_learn")
         human_vs_cfr(solver, human_player=hp, update_cfr=learn, save_path=DEFAULT_SAVE_PATH)
     else:
-        train_cfr()
+        # python cfr_selfplay_train.py [n_iters]
+        n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 60_000
+        train_cfr(n_iters=n)
