@@ -390,28 +390,11 @@ class CFRSolver:
         mask[legal] = 1.0 / len(legal)
         return mask
 
-    def _rollout_value(self, nhp, nen, nahp, naen, g, final_v):
-        """
-        用一步真实展开替代纯启发估值（P1 视角）。
-        枚举双方下一步所有合法动作，game_step 自动处理空城矩阵，
-        自然权重了"下回合对手/自己能量为0"的各种概率。
-        """
-        ns   = state_id(nhp, nen, nahp, naen)
-        npl  = legal_actions(nen)
-        nal  = legal_actions(naen)
-        sg1n = self.current_strategy(0, ns, npl)
-        sg2n = self.current_strategy(1, ns, nal)
-        imm  = 0.0
-        for na1 in npl:
-            for na2 in nal:
-                nhp2, nen2, nahp2, naen2, d2, w2 = game_step(nhp, nen, nahp, naen, na1, na2)
-                if d2:
-                    vi = terminal_value(w2, nhp2, nahp2)
-                else:
-                    vi = heuristic_value(nhp2, nen2, nahp2, naen2,
-                                         legal_actions(nen2), legal_actions(naen2),
-                                         self.h_params)
-                imm += sg1n[na1] * sg2n[na2] * vi
+    def _next_value(self, nhp, nen, nahp, naen, g, final_v):
+        """非终局状态的价值估算（P1 视角）：heuristic 与终局信号混合。"""
+        npl = legal_actions(nen)
+        nal = legal_actions(naen)
+        imm = heuristic_value(nhp, nen, nahp, naen, npl, nal, self.h_params)
         return (1 - g) * imm + g * final_v
 
     def run_episode(self, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
@@ -461,7 +444,7 @@ class CFRSolver:
                     if d:
                         vi = terminal_value(w, nhp, nahp)
                     else:
-                        vi = self._rollout_value(nhp, nen, nahp, naen, g, final_v)
+                        vi = self._next_value(nhp, nen, nahp, naen, g, final_v)
                     v += sg2[opp] * vi
                 cf1[alt] = v
             ev1 = float(sg1 @ cf1)
@@ -475,7 +458,7 @@ class CFRSolver:
                     if d:
                         vi = -terminal_value(w, nhp, nahp)
                     else:
-                        vi = -self._rollout_value(nhp, nen, nahp, naen, g, final_v)
+                        vi = -self._next_value(nhp, nen, nahp, naen, g, final_v)
                     v += sg1[opp] * vi
                 cf2[alt] = v
             ev2 = float(sg2 @ cf2)
