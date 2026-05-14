@@ -6,6 +6,7 @@ CFR 自博弈训练 - 掌心战争
 克制链: 大招(3) > 单枪(0) > 清零(8) > 三枪(2) > 大招(3)
         反弹(7) > 单枪(0) | 单枪(0) 部分克制 双枪(1)/三枪(2)
 清零条件: HP_MATRIX[对手技能][8] == 1 时回血 (对手出三枪/大招等)
+清零克制: 清零成功(ZERO_TABLE[8][opp]==1) 且 回合前对方能量>=我方; 满血(HP=4)时严格大于
 空城被动: 0能量受攻击时额外反伤
 """
 
@@ -26,7 +27,11 @@ MAX_ROUNDS = 30
 GAMMA      = 0.99   # 折现率
 BLEND_STEPS = 5     # 终局信号混合窗口
 
-DEFAULT_SAVE_PATH = "cfr_output/cfr_strategy.npz"
+# 空城反杀权重：一方空城时对手低血量 → 任何进攻都会触发空城反伤并击杀
+# HP_MATRIX_empty[小防(4)][单枪/双枪]=-2, [三枪/大招]=-1 → 对手HP≤1时必杀
+CKILL_W = 0.50
+
+DEFAULT_SAVE_PATH = "cfr_output/cfr_strategy.json"
 
 # 克制链（攻方技能, 守方技能, 描述, 攻方最低能量, 守方最低能量）
 # 只有双方能量同时满足时，克制关系才真正成立
@@ -59,6 +64,12 @@ COUNTER_CHAIN = [
     (6, 7, "能量>反弹",    0, 1),   # 能量+1能 vs 反弹-1能，净差+2（强克制）
     (6, 4, "能量≥小防",    0, 0),   # 能量+1能 vs 小防±0能，净差+1（同单枪>双枪/三枪）
 ]
+
+# 清零动态克制（独立追踪，条件不同于 COUNTER_CHAIN 固定阈值）：
+#   清零成功（ZERO_TABLE[8][opp]==1）且回合前对方能量 >= 我方能量
+#   若我方血量 == 4（满血），则排除相等情况，要求对方能量 > 我方能量
+ZERO_COUNTER_LABEL = "清零成功克制"
+_ZERO_SUCCESS_VS   = [s for s in range(NUM_SKILLS) if ZERO_TABLE[8][s]]
 
 # 显式克制优势矩阵
 # COUNTER_ADV[atk][def] = 出 atk 时对阵 def 的综合净优势（atk方视角，正值=atk占优）
@@ -161,7 +172,12 @@ class HeuristicParams:
         ph = energy_phase(pEn, aEn)
         w  = self.w[ph]
         hp_adv = (pHP - aHP) / MAX_HP
-        en_adv = (pEn - aEn) / (MAX_ENERGY + 1)
+
+        # HP-scaled energy advantage: dying player's energy is worth less because
+        # they're vulnerable and one hit from dying, making their energy plans irrelevant.
+        p_vit = pHP / MAX_HP   # vitality fraction ∈ (0,1]
+        a_vit = aHP / MAX_HP
+        en_adv = (pEn * p_vit - aEn * a_vit) / (MAX_ENERGY + 1)
 
         counter = 0.0
         if p_legal and a_legal:
@@ -181,15 +197,25 @@ class HeuristicParams:
         p2_danger = _danger_signal(aHP, aEn, p_legal)  # P2危险 ∈ [-2, 0]，对P1是正收益
         danger_net = danger - p2_danger                 # 对称：P1危险↓ P2危险↑
 
+        # HP-aware 空城大招优势 & 空城惩罚（对手HP越低，其能量越没价值）
         extra = 0.0
         if ph == 1:
             extra = (0.08 if pEn >= 3 else 0.0) - (0.08 if aEn >= 3 else 0.0)
         elif ph == 2:
-            extra = ((0.07 if pEn >= 3 else 0.0) - (0.07 if aEn >= 3 else 0.0)
-                     + (-0.06 if pEn == 0 and aEn > 0 else 0.0)
-                     - (-0.06 if aEn == 0 and pEn > 0 else 0.0))  # 对称：P2在空城P1有优势
+            extra = ((0.07 if pEn >= 3 else 0.0) * p_vit
+                     - (0.07 if aEn >= 3 else 0.0) * a_vit
+                     + (-0.06 * a_vit if pEn == 0 and aEn > 0 else 0.0)
+                     - (-0.06 * p_vit if aEn == 0 and pEn > 0 else 0.0))
 
-        val = w[0]*hp_adv + w[1]*en_adv + w[2]*counter + w[3]*danger_net + extra
+        # 空城反杀威胁：一方空城 + 对手血量极低 → 对手任何进攻都会被空城被动反杀
+        # HP_MATRIX_empty[小防(4)][攻击] 最小反伤 = 1，故对手HP≤1时必然被反杀
+        ckill = 0.0
+        if pEn == 0 and aHP <= 1:   # P1空城，P2极低血量 → P2不敢攻击 → P1大优
+            ckill += CKILL_W
+        if aEn == 0 and pHP <= 1:   # P2空城，P1极低血量 → P1不敢攻击 → P2大优
+            ckill -= CKILL_W
+
+        val = w[0]*hp_adv + w[1]*en_adv + w[2]*counter + w[3]*danger_net + extra + ckill
         return max(-1.5, min(1.5, val))
 
     def update_episode(self, records, final_v):
@@ -205,7 +231,9 @@ class HeuristicParams:
             ph = energy_phase(pEn, aEn)
             w  = self.w[ph]
             hp_adv = (pHP - aHP) / MAX_HP
-            en_adv = (pEn - aEn) / (MAX_ENERGY + 1)
+            p_vit = pHP / MAX_HP
+            a_vit = aHP / MAX_HP
+            en_adv = (pEn * p_vit - aEn * a_vit) / (MAX_ENERGY + 1)
 
             # HP / 能量权重: 小步全局更新
             w[0] = float(np.clip(w[0] + self.LR * error * hp_adv,  0.10, 1.50))
@@ -312,6 +340,12 @@ def _winner(pHP, aHP):
     if aHP <= 0: return 1
     return 2
 
+def overtime_winner(pHP, aHP):
+    """30回合到时：血量多的获胜，相等才平局"""
+    if pHP > aHP: return 1
+    if aHP > pHP: return 2
+    return 3
+
 
 def terminal_value(winner, pHP, aHP):
     """P1 视角终局价值 ∈ [-1.25, 1.25]"""
@@ -339,9 +373,10 @@ def heuristic_value(pHP, pEn, aHP, aEn, p_legal=None, a_legal=None, params=None,
 
     phase = energy_phase(pEn, aEn)
     hp_adv = (pHP - aHP) / MAX_HP
+    p_vit = pHP / MAX_HP
+    a_vit = aHP / MAX_HP
 
     # ── 克制对位优势（需要知道双方可用技能集）─────────────────
-    # P1 的最坏情况净优势：P1 最优选择下 P2 最差应对的克制收益
     counter_bal = 0.0
     if p_legal is not None and a_legal is not None and p_legal and a_legal:
         p1_guarantee = max(
@@ -350,23 +385,28 @@ def heuristic_value(pHP, pEn, aHP, aEn, p_legal=None, a_legal=None, params=None,
         )
         counter_bal = float(np.clip(p1_guarantee, -MAX_HP, MAX_HP)) / MAX_HP * 0.10
 
+    # 空城反杀威胁（同 HeuristicParams.eval）
+    ckill = 0.0
+    if pEn == 0 and aHP <= 1:
+        ckill += CKILL_W
+    if aEn == 0 and pHP <= 1:
+        ckill -= CKILL_W
+
     if phase == 0:
-        # 双方空城：血量几乎决定一切；克制无从发挥，但保留小项
-        return hp_adv * 0.88 + ((pEn - aEn) / (MAX_ENERGY + 1)) * 0.05 + counter_bal * 0.5
+        en_adv0 = (pEn * p_vit - aEn * a_vit) / (MAX_ENERGY + 1)
+        return hp_adv * 0.88 + en_adv0 * 0.05 + counter_bal * 0.5 + ckill
 
     elif phase == 1:
-        # 低能阶段：克制链部分激活，传入的可用技能集决定具体对位
-        en_adv = (pEn - aEn) / (MAX_ENERGY + 1)
+        en_adv = (pEn * p_vit - aEn * a_vit) / (MAX_ENERGY + 1)
         p1_ulti_ready = 0.08 if pEn >= 3 else 0.0
         p2_ulti_ready = 0.08 if aEn >= 3 else 0.0
-        return hp_adv * 0.60 + en_adv * 0.22 + p1_ulti_ready - p2_ulti_ready + counter_bal
+        return hp_adv * 0.60 + en_adv * 0.22 + p1_ulti_ready - p2_ulti_ready + counter_bal + ckill
 
     else:
-        # 高能阶段：完整克制链，counter_bal 权重最高
-        en_adv = (pEn - aEn) / (MAX_ENERGY + 1)
-        ulti_edge = (0.07 if pEn >= 3 else 0.0) - (0.07 if aEn >= 3 else 0.0)
-        empty_risk = -0.08 if pEn == 0 and aEn > 0 else 0.0
-        return hp_adv * 0.48 + en_adv * 0.26 + ulti_edge + empty_risk + counter_bal
+        en_adv = (pEn * p_vit - aEn * a_vit) / (MAX_ENERGY + 1)
+        ulti_edge = (0.07 if pEn >= 3 else 0.0) * p_vit - (0.07 if aEn >= 3 else 0.0) * a_vit
+        empty_risk = -0.08 * a_vit if pEn == 0 and aEn > 0 else 0.0
+        return hp_adv * 0.48 + en_adv * 0.26 + ulti_edge + empty_risk + counter_bal + ckill
 
 
 def step_cf_value(php, pen, ahp, aen, alt_p, fixed_a, final_v, gamma, params=None):
@@ -387,6 +427,8 @@ def step_cf_value(php, pen, ahp, aen, alt_p, fixed_a, final_v, gamma, params=Non
 # ── CFR 求解器 ────────────────────────────────────────────
 
 N_STATES = (MAX_HP + 1) * (MAX_ENERGY + 1) * (MAX_HP + 1) * (MAX_ENERGY + 1)  # 1225
+
+LOOKAHEAD_DEPTH = 3  # 反事实价值估算时向后探索的额外回合数
 
 
 class CFRSolver:
@@ -427,16 +469,37 @@ class CFRSolver:
         mask[legal] = 1.0 / len(legal)
         return mask
 
-    def _next_value(self, nhp, nen, nahp, naen):
-        """非终局状态的价值估算（P1 视角）：纯启发值。
-        不注入采样终局信号——final_v 来自采样路径，对反事实 (alt,opp) 有偏。
-        对位优势按 P2 当前平均策略期望计算，让启发值随对手策略演化而动态调整。"""
+    def _lookahead_value(self, nhp, nen, nahp, naen, depth, cache):
+        """向后展开 depth 步（用当前平均策略期望），末尾用启发值估算。
+        cache: 同一 CFR 更新轮次内共享，避免不同 (alt,opp) 对踩到相同后续状态时重复计算。"""
+        if nhp <= 0 or nahp <= 0:
+            return terminal_value(_winner(nhp, nahp), nhp, nahp)
+        key = (nhp, nen, nahp, naen, depth)
+        if key in cache:
+            return cache[key]
         npl = legal_actions(nen)
         nal = legal_actions(naen)
-        ns = state_id(nhp, nen, nahp, naen)
+        ns  = state_id(nhp, nen, nahp, naen)
         p1_sg  = self.average_strategy(0, ns, npl)
         opp_sg = self.average_strategy(1, ns, nal)
-        return heuristic_value(nhp, nen, nahp, naen, npl, nal, self.h_params, opp_sg, p1_sg)
+        if depth == 0:
+            v = heuristic_value(nhp, nen, nahp, naen, npl, nal, self.h_params, opp_sg, p1_sg)
+            cache[key] = v
+            return v
+        val = 0.0
+        for p in npl:
+            for a in nal:
+                n2hp, n2en, n2ahp, n2aen, d, w = game_step(nhp, nen, nahp, naen, p, a)
+                vi = (terminal_value(w, n2hp, n2ahp) if d
+                      else GAMMA * self._lookahead_value(n2hp, n2en, n2ahp, n2aen, depth - 1, cache))
+                val += p1_sg[p] * opp_sg[a] * vi
+        cache[key] = val
+        return val
+
+    def _next_value(self, nhp, nen, nahp, naen, cache):
+        """非终局状态的价值估算（P1 视角）：向后探索 LOOKAHEAD_DEPTH 步后用启发值。
+        cache 在同一 CFR 更新轮次内共享以避免重复计算。"""
+        return self._lookahead_value(nhp, nen, nahp, naen, LOOKAHEAD_DEPTH, cache)
 
     def run_episode(self, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN), epsilon=0.0):
         """运行完整一局，收集轨迹并执行 CFR 遗憾更新。
@@ -464,30 +527,33 @@ class CFRSolver:
             self.phase_steps[energy_phase(pEn, aEn)] += 1
             pHP, pEn, aHP, aEn, done, winner = game_step(pHP, pEn, aHP, aEn, a1, a2)
 
+        if not done:
+            winner = overtime_winner(pHP, aHP)
         T = len(traj)
         self.episode_count += 1
         self.total_steps   += T
 
         # ── 反向遍历轨迹，更新 CFR 遗憾 ───────────────────────
         for s, l1, l2, sg1, sg2, a1, a2, php, pen, ahp, aen in traj:
-            # P1 反事实价值向量（external sampling + 一步展开）
+            _cache = {}  # per-step 缓存：同一回合内不同 alt/opp 组合共享后续状态估值
+            # P1 反事实价值向量（external sampling + lookahead 展开）
             cf1 = np.zeros(NUM_SKILLS)
             for alt in l1:
                 v = 0.0
                 for opp in l2:
                     nhp, nen, nahp, naen, d, w = game_step(php, pen, ahp, aen, alt, opp)
-                    vi = terminal_value(w, nhp, nahp) if d else self._next_value(nhp, nen, nahp, naen)
+                    vi = terminal_value(w, nhp, nahp) if d else GAMMA * self._next_value(nhp, nen, nahp, naen, _cache)
                     v += sg2[opp] * vi
                 cf1[alt] = v
             ev1 = float(sg1 @ cf1)
 
-            # P2 反事实价值向量（external sampling + 一步展开，零和取负）
+            # P2 反事实价值向量（external sampling + lookahead 展开，零和取负）
             cf2 = np.zeros(NUM_SKILLS)
             for alt in l2:
                 v = 0.0
                 for opp in l1:
                     nhp, nen, nahp, naen, d, w = game_step(php, pen, ahp, aen, opp, alt)
-                    vi = -terminal_value(w, nhp, nahp) if d else -self._next_value(nhp, nen, nahp, naen)
+                    vi = -terminal_value(w, nhp, nahp) if d else -GAMMA * self._next_value(nhp, nen, nahp, naen, _cache)
                     v += sg1[opp] * vi
                 cf2[alt] = v
             ev2 = float(sg2 @ cf2)
@@ -497,6 +563,9 @@ class CFRSolver:
                 self.R[0][s][alt] += cf1[alt] - ev1
             for alt in l2:
                 self.R[1][s][alt] += cf2[alt] - ev2
+            # CFR+：截断负遗憾，只保留有正收益的记忆，显著加快收敛
+            np.maximum(self.R[0][s], 0, out=self.R[0][s])
+            np.maximum(self.R[1][s], 0, out=self.R[1][s])
 
             # 更新策略累积（线性加权：越晚的迭代权重越高）
             weight = float(self.episode_count)
@@ -512,6 +581,13 @@ class CFRSolver:
                 # 反向：P2 是攻方
                 elif a2 == atk and a1 == dfn and aen >= en_atk and pen >= en_dfn:
                     self.counter_hits[lbl] += 1
+            # 清零动态克制：清零成功 + 对方能量>=我方（满血时须严格大于）
+            if a1 == 8 and ZERO_TABLE[8][a2]:
+                if (php == 4 and aen > pen) or (php != 4 and aen >= pen):
+                    self.counter_hits[ZERO_COUNTER_LABEL] += 1
+            if a2 == 8 and ZERO_TABLE[8][a1]:
+                if (ahp == 4 and pen > aen) or (ahp != 4 and pen >= aen):
+                    self.counter_hits[ZERO_COUNTER_LABEL] += 1
 
         return winner, T
 
@@ -565,6 +641,8 @@ def best_response_winrate(solver, player_br=2, n_eval=300,
             a1, a2 = (fixed_a, best_a) if fixed_player == 0 else (best_a, fixed_a)
             pHP, pEn, aHP, aEn, done, winner = game_step(pHP, pEn, aHP, aEn, a1, a2)
 
+        if not done:
+            winner = overtime_winner(pHP, aHP)
         if winner == player_br:
             br_wins += 1
 
@@ -600,7 +678,7 @@ def analyze_nash(solver, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
     # ── Phase 1: 低能（1-2能，大招不可用）────────────────
     print(f"\n  === Phase 1: 低能区（克制链部分激活，无大招）===")
     phase1_states = [
-        (*init,           "起始状态 3HP 2能(对称)"),
+        (*init,           f"起始状态 {init[0]}HP {init[1]}能(对称)"),
         (2, 2, 2, 2,      "均势 2HP 2能"),
         (2, 1, 2, 2,      "P1 1能 vs P2 2能"),
         (2, 2, 2, 1,      "P1 2能 vs P2 1能"),
@@ -646,42 +724,96 @@ def analyze_nash(solver, init=(INIT_HP, INIT_EN, INIT_HP, INIT_EN)):
         bar  = "█" * int(rate * 50)
         print(f"  {lbl:14s}(攻≥{en_atk}能,守≥{en_dfn}能): "
               f"{cnt:5d}次 {rate:.3%} {bar}")
+    # 清零动态克制（对方能量>=我方；满血时须严格大于）
+    cnt  = solver.counter_hits.get(ZERO_COUNTER_LABEL, 0)
+    rate = cnt / max(total, 1)
+    bar  = "█" * int(rate * 50)
+    print(f"  {ZERO_COUNTER_LABEL}(敌能≥我能,满血须敌>我): "
+          f"{cnt:5d}次 {rate:.3%} {bar}")
 
 
 def save_strategy(solver, path=DEFAULT_SAVE_PATH):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    ctr_keys = list(solver.counter_hits.keys())
-    ctr_vals = [solver.counter_hits[k] for k in ctr_keys]
-    np.savez(path, R0=solver.R[0], R1=solver.R[1],
-             S0=solver.S[0], S1=solver.S[1],
-             hw=solver.h_params.w,
-             total_steps=np.array([solver.total_steps]),
-             episode_count=np.array([solver.episode_count]),
-             phase_steps=np.array(solver.phase_steps),
-             ctr_keys=np.array(ctr_keys, dtype=object),
-             ctr_vals=np.array(ctr_vals, dtype=np.int64))
-    print(f"[保存] 策略 → {path}")
+    if path.endswith('.json'):
+        data = {
+            "R0": solver.R[0].tolist(), "R1": solver.R[1].tolist(),
+            "S0": solver.S[0].tolist(), "S1": solver.S[1].tolist(),
+            "hw": solver.h_params.w.tolist(),
+            "total_steps": solver.total_steps,
+            "episode_count": solver.episode_count,
+            "phase_steps": list(solver.phase_steps),
+            "counter_hits": dict(solver.counter_hits),
+            "cfg": [INIT_HP, INIT_EN, MAX_ROUNDS, int(GAMMA * 1000)],
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    else:
+        ctr_keys = list(solver.counter_hits.keys())
+        ctr_vals = [solver.counter_hits[k] for k in ctr_keys]
+        np.savez(path, R0=solver.R[0], R1=solver.R[1],
+                 S0=solver.S[0], S1=solver.S[1],
+                 hw=solver.h_params.w,
+                 total_steps=np.array([solver.total_steps]),
+                 episode_count=np.array([solver.episode_count]),
+                 phase_steps=np.array(solver.phase_steps),
+                 ctr_keys=np.array(ctr_keys, dtype=object),
+                 ctr_vals=np.array(ctr_vals, dtype=np.int64),
+                 cfg=np.array([INIT_HP, INIT_EN, MAX_ROUNDS, int(GAMMA * 1000)]))
+    print(f"[保存] 策略 → {path}  (episode={solver.episode_count})")
+
+
+def _load_cfg_check(saved_cfg):
+    curr_cfg = [INIT_HP, INIT_EN, MAX_ROUNDS, int(GAMMA * 1000)]
+    if saved_cfg != curr_cfg:
+        print(f"[警告] 策略文件参数与当前不符！")
+        print(f"  文件: INIT_HP={saved_cfg[0]} INIT_EN={saved_cfg[1]} "
+              f"MAX_ROUNDS={saved_cfg[2]} GAMMA={saved_cfg[3]/1000:.3f}")
+        print(f"  当前: INIT_HP={curr_cfg[0]}  INIT_EN={curr_cfg[1]}  "
+              f"MAX_ROUNDS={curr_cfg[2]}  GAMMA={curr_cfg[3]/1000:.3f}")
+        print(f"  → 旧策略数据在当前起始状态无效，建议用 --fresh 重新训练。")
 
 
 def load_strategy(solver, path=DEFAULT_SAVE_PATH):
-    if not os.path.exists(path):
-        return False
-    d = np.load(path, allow_pickle=True)
-    solver.R[0][:] = d["R0"]; solver.R[1][:] = d["R1"]
-    solver.S[0][:] = d["S0"]; solver.S[1][:] = d["S1"]
-    if "hw" in d:
-        solver.h_params.w[:] = d["hw"]
-    if "total_steps" in d:
-        solver.total_steps = int(d["total_steps"][0])
-    if "episode_count" in d:
-        solver.episode_count = int(d["episode_count"][0])
-    if "phase_steps" in d:
-        solver.phase_steps = list(d["phase_steps"].astype(int))
-    if "ctr_keys" in d and "ctr_vals" in d:
-        for k, v in zip(d["ctr_keys"], d["ctr_vals"]):
-            solver.counter_hits[str(k)] += int(v)
-    print(f"[加载] 策略 ← {path}")
-    return True
+    # 优先读 .json（exe打包兼容），fallback .npz（训练环境）
+    json_path = path if path.endswith('.json') else path.replace('.npz', '.json')
+    npz_path  = path if path.endswith('.npz')  else path.replace('.json', '.npz')
+
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if "cfg" in d:
+            _load_cfg_check(d["cfg"])
+        solver.R[0][:] = np.array(d["R0"]); solver.R[1][:] = np.array(d["R1"])
+        solver.S[0][:] = np.array(d["S0"]); solver.S[1][:] = np.array(d["S1"])
+        if "hw" in d:
+            solver.h_params.w[:] = np.array(d["hw"])
+        if "total_steps"   in d: solver.total_steps   = int(d["total_steps"])
+        if "episode_count" in d: solver.episode_count = int(d["episode_count"])
+        if "phase_steps"   in d: solver.phase_steps   = list(d["phase_steps"])
+        if "counter_hits"  in d:
+            for k, v in d["counter_hits"].items():
+                solver.counter_hits[k] += int(v)
+        print(f"[加载] 策略 ← {json_path}  (episode={solver.episode_count})")
+        return True
+
+    if os.path.exists(npz_path):
+        d = np.load(npz_path, allow_pickle=True)
+        if "cfg" in d:
+            _load_cfg_check(list(d["cfg"].astype(int)))
+        solver.R[0][:] = d["R0"]; solver.R[1][:] = d["R1"]
+        solver.S[0][:] = d["S0"]; solver.S[1][:] = d["S1"]
+        if "hw" in d:
+            solver.h_params.w[:] = d["hw"]
+        if "total_steps"   in d: solver.total_steps   = int(d["total_steps"][0])
+        if "episode_count" in d: solver.episode_count = int(d["episode_count"][0])
+        if "phase_steps"   in d: solver.phase_steps   = list(d["phase_steps"].astype(int))
+        if "ctr_keys" in d and "ctr_vals" in d:
+            for k, v in zip(d["ctr_keys"], d["ctr_vals"]):
+                solver.counter_hits[str(k)] += int(v)
+        print(f"[加载] 策略 ← {npz_path}  (episode={solver.episode_count})")
+        return True
+
+    return False
 
 
 # ── 主训练循环 ────────────────────────────────────────────
@@ -694,9 +826,13 @@ def train_cfr(
     init_state   = (INIT_HP, INIT_EN, INIT_HP, INIT_EN),
     save_path    = DEFAULT_SAVE_PATH,
     resume       = True,
+    fresh        = False,
 ):
     solver = CFRSolver()
-    if resume:
+    if fresh and os.path.exists(save_path):
+        os.remove(save_path)
+        print(f"[重置] 已删除旧策略文件 {save_path}，从零开始训练。")
+    elif resume:
         load_strategy(solver, save_path)
 
     print(f"\n{'='*58}")
@@ -714,7 +850,16 @@ def train_cfr(
     for it in range(1, n_iters + 1):
         # ε 从 0.20 线性衰减到 0.02：早期多探索，后期收敛
         epsilon = max(0.02, 0.20 * (1.0 - it / n_iters))
-        winner, rnd = solver.run_episode(init_state, epsilon=epsilon)
+        # 每 4 局随机采样一个非标准初始状态，主动覆盖高能/低血场景
+        if it % 4 == 0:
+            hp1 = np.random.randint(1, MAX_HP + 1)
+            hp2 = np.random.randint(1, MAX_HP + 1)
+            en1 = np.random.randint(0, MAX_ENERGY + 1)
+            en2 = np.random.randint(0, MAX_ENERGY + 1)
+            ep_init = (hp1, en1, hp2, en2)
+        else:
+            ep_init = init_state
+        winner, rnd = solver.run_episode(ep_init, epsilon=epsilon)
         wins[winner - 1] += 1
 
         if it % log_every == 0:
@@ -808,6 +953,8 @@ def generate_cfr_dataset(solver, n_games=5000,
             traj.append((pHP, pEn, aHP, aEn, a1, a2))
             pHP, pEn, aHP, aEn, done, winner = game_step(pHP, pEn, aHP, aEn, a1, a2)
 
+        if not done:
+            winner = overtime_winner(pHP, aHP)
         wins[winner - 1] += 1
         final_v = terminal_value(winner, pHP, aHP)
 
@@ -918,12 +1065,13 @@ def human_vs_cfr(solver, human_player=1,
                 h_legal = l1 if human_is_p1 else l2
                 ai_legal = l2 if human_is_p1 else l1
 
+                # AI 先决定（双盲：AI 不可见人类选择）
+                ai_sg = solver.average_strategy(ai_idx, sid, ai_legal)
+                ai_action = int(np.random.choice(NUM_SKILLS, p=ai_sg))
+
                 _print_state(pHP, pEn, aHP, aEn, rnd, human_is_p1)
                 _print_skills(h_legal)
                 h_action = _ask_skill(h_legal)
-
-                ai_sg = solver.average_strategy(ai_idx, sid, ai_legal)
-                ai_action = int(np.random.choice(NUM_SKILLS, p=ai_sg))
 
                 a1 = h_action if human_is_p1 else ai_action
                 a2 = ai_action if human_is_p1 else h_action
@@ -943,13 +1091,23 @@ def human_vs_cfr(solver, human_player=1,
                     pred_v = heuristic_value(pHP, pEn, aHP, aEn, npl, nal, solver.h_params)
                     h_records.append((pHP, pEn, aHP, aEn, nal, pred_v))
 
+            if not done:
+                winner = overtime_winner(pHP, aHP)
+
             # 克制链统计
-            for _, _, _, a1_, a2_, _, pen_, _, aen_ in traj:
+            for _, _, _, a1_, a2_, php_, pen_, ahp_, aen_ in traj:
                 for atk, dfn, lbl, en_atk, en_dfn in COUNTER_CHAIN:
                     if a1_ == atk and a2_ == dfn and pen_ >= en_atk and aen_ >= en_dfn:
                         solver.counter_hits[lbl] += 1
                     elif a2_ == atk and a1_ == dfn and aen_ >= en_atk and pen_ >= en_dfn:
                         solver.counter_hits[lbl] += 1
+                # 清零动态克制：清零成功 + 对方能量>=我方（满血时须严格大于）
+                if a1_ == 8 and ZERO_TABLE[8][a2_]:
+                    if (php_ == 4 and aen_ > pen_) or (php_ != 4 and aen_ >= pen_):
+                        solver.counter_hits[ZERO_COUNTER_LABEL] += 1
+                if a2_ == 8 and ZERO_TABLE[8][a1_]:
+                    if (ahp_ == 4 and pen_ > aen_) or (ahp_ != 4 and pen_ >= aen_):
+                        solver.counter_hits[ZERO_COUNTER_LABEL] += 1
 
             # 结局显示
             if winner == 1:
@@ -1019,22 +1177,110 @@ def human_vs_cfr(solver, human_player=1,
     return wins
 
 
+# ── 并行训练 ──────────────────────────────────────────────
+
+def _parallel_worker(args):
+    worker_id, n_iters, init_state = args
+    solver = CFRSolver()
+    for it in range(1, n_iters + 1):
+        epsilon = max(0.02, 0.20 * (1.0 - it / n_iters))
+        if it % 4 == 0:
+            ep_init = (
+                np.random.randint(1, MAX_HP + 1),
+                np.random.randint(0, MAX_ENERGY + 1),
+                np.random.randint(1, MAX_HP + 1),
+                np.random.randint(0, MAX_ENERGY + 1),
+            )
+        else:
+            ep_init = init_state
+        solver.run_episode(ep_init, epsilon=epsilon)
+    return (
+        solver.R[0].copy(), solver.R[1].copy(),
+        solver.S[0].copy(), solver.S[1].copy(),
+        solver.h_params.w.copy(),
+        solver.total_steps, solver.episode_count,
+        list(solver.phase_steps),
+        dict(solver.counter_hits),
+    )
+
+
+def train_parallel(
+    n_iters    = 60_000,
+    n_workers  = None,
+    init_state = (INIT_HP, INIT_EN, INIT_HP, INIT_EN),
+    save_path  = DEFAULT_SAVE_PATH,
+    resume     = True,
+    fresh      = False,
+):
+    import multiprocessing as mp
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 2)
+
+    iters_per_worker = n_iters // n_workers
+    print(f"\n{'='*58}")
+    print(f"  CFR 并行训练  workers={n_workers}  每进程={iters_per_worker}局")
+    print(f"  总迭代: {n_iters}  起始: HP={init_state[0]} 能量={init_state[1]}")
+    print(f"{'='*58}\n")
+
+    args = [(i, iters_per_worker, init_state) for i in range(n_workers)]
+    with mp.Pool(n_workers) as pool:
+        results = pool.map(_parallel_worker, args)
+
+    solver = CFRSolver()
+    if not fresh:
+        load_strategy(solver, save_path)
+    elif os.path.exists(save_path):
+        os.remove(save_path)
+
+    for R0, R1, S0, S1, hw, ts, ec, ps, ch in results:
+        solver.R[0] += R0
+        solver.R[1] += R1
+        solver.S[0] += S0
+        solver.S[1] += S1
+        solver.total_steps   += ts
+        solver.episode_count += ec
+        for i in range(3):
+            solver.phase_steps[i] += ps[i]
+        for k, v in ch.items():
+            solver.counter_hits[k] += v
+    solver.h_params.w[:] = np.mean([r[4] for r in results], axis=0)
+
+    save_strategy(solver, save_path)
+    analyze_nash(solver, init_state)
+    return solver
+
+
 if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.freeze_support()
+
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "analyze":
+    args = sys.argv[1:]
+    fresh_flag = "--fresh" in args
+    if fresh_flag:
+        args = [a for a in args if a != "--fresh"]
+
+    cmd = args[0] if args else "train"
+
+    if cmd == "analyze":
         analyze_saved()
-    elif len(sys.argv) > 1 and sys.argv[1] == "dataset":
+    elif cmd == "dataset":
         solver = CFRSolver()
         load_strategy(solver)
         generate_cfr_dataset(solver)
-    elif len(sys.argv) > 1 and sys.argv[1] == "human":
+    elif cmd == "human":
         # python cfr_selfplay_train.py human [1|2] [no_learn]
         solver = CFRSolver()
         load_strategy(solver, DEFAULT_SAVE_PATH)
-        hp = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] in ("1", "2") else 1
-        learn = not (len(sys.argv) > 3 and sys.argv[3] == "no_learn")
+        hp = int(args[1]) if len(args) > 1 and args[1] in ("1", "2") else 1
+        learn = not (len(args) > 2 and args[2] == "no_learn")
         human_vs_cfr(solver, human_player=hp, update_cfr=learn, save_path=DEFAULT_SAVE_PATH)
+    elif cmd == "parallel":
+        # python cfr_selfplay_train.py parallel [n_iters] [n_workers] [--fresh]
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 60_000
+        w = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+        train_parallel(n_iters=n, n_workers=w, fresh=fresh_flag)
     else:
-        # python cfr_selfplay_train.py [n_iters]
-        n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 60_000
-        train_cfr(n_iters=n)
+        # python cfr_selfplay_train.py [n_iters] [--fresh]
+        n = int(cmd) if cmd.isdigit() else 60_000
+        train_cfr(n_iters=n, fresh=fresh_flag)
