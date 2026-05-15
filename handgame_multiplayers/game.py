@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.table import Table
 import msvcrt
 import os
+import torch
 
 
 class Game:
@@ -73,6 +74,29 @@ class Game:
     def set_player_ai_profile(self, player_index: int, profile_name: str) -> None:
         """快速把某个玩家切换到已注册的命名 AI 配置。"""
         self.set_player_ai(player_index, enabled=True, profile_name=profile_name)
+
+    def set_player_ai_max_search_depth(self, player_index: int, max_depth: int) -> None:
+        """限制某个 AI 的最大搜索深度。"""
+        if max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        config = self.player_ai_configs[player_index]
+        controller = self.player_ai_controllers[player_index]
+        if config is None or controller is None:
+            raise RuntimeError("该位置未启用 AI，无法设置最大搜索深度。")
+
+        config.search.depth = min(config.search.depth, max_depth)
+        controller.search.depth = min(controller.search.depth, max_depth)
+
+    def load_player_ai_model(self, player_index: int, model_path: str) -> None:
+        """为指定位置加载 AI 模型权重。"""
+        controller = self.player_ai_controllers[player_index]
+        if controller is None:
+            raise RuntimeError("该位置未启用 AI，无法加载模型。")
+
+        checkpoint = torch.load(model_path, map_location="cpu" \
+        "")
+        state = checkpoint["model_state"] if isinstance(checkpoint, dict) else checkpoint
+        controller.model.load_state_dict(state)
 
     def is_player_ai(self, player_index: int) -> bool:
         """检查某个玩家是否由 AI 托管。"""
@@ -240,10 +264,18 @@ class Game:
                 return 0, None
 
             plan = controller.choose_action(player, enemy)
+            target_index = plan.target_index
+            need_target = False
+            for info in player.action_list:
+                if info[0] == plan.action_id:
+                    need_target = bool(info[3])
+                    break
+            if need_target:
+                target_index = enemy_index
             self.debug_print(
-                f"{player.name} (AI) 选择: {plan.action_id} / {plan.action_name} / target={plan.target_index}"
+                f"{player.name} (AI) 选择: {plan.action_id} / {plan.action_name} / target={target_index}"
             )
-            return plan.action_id, plan.target_index
+            return plan.action_id, target_index
 
         return self.prompt_action(player_index, player)
 

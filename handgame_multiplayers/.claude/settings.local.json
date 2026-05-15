@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 120 python test_train.py)",
+      "Bash(timeout 180 python test_train_full.py)",
+      "Bash(dir F:handgamehandgame_multiplayers *)",
+      "Bash(python -c \"import ai; print\\('ai.py imports OK'\\); print\\('SearchConfig fields:', [f.name for f in __import__\\('dataclasses'\\).fields\\(ai.SearchConfig\\)]\\); print\\('TrainSearchConfig fields:', [f.name for f in __import__\\('dataclasses'\\).fields\\(ai.TrainSearchConfig\\)]\\)\")",
+      "Bash(python test_regret_pruning.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python test_regret_pruning.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python test_train.py)"
+    ]
+  }
+}

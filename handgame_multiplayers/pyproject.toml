@@ -8,4 +8,17 @@ dependencies = [
     "openpyxl>=3.1.0",
     "pywin32>=311",
     "rich>=15.0.0",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "matplotlib>=3.10.9",
 ]
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true  # 关键：这告诉 uv 只有明确指定来源的包才去这里找
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }

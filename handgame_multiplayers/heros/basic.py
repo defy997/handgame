@@ -171,7 +171,7 @@ class BasicHero:
         counter = next(
             (
                 a for a in self.defense_stack
-                if a.attack_type == "anti-group-attack" and a.source == target
+                if a.attack_type in ["anti-group-attack", "attack"] and a.source == target
             ),
             None,
         )

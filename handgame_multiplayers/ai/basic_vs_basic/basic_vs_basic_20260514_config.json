@@ -1,0 +1,22 @@
+{
+  "episodes": 1000,
+  "max_rounds": 50,
+  "batch_size": 128,
+  "replay_size": 2048,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "cfr_iters": 16,
+  "search_depth": 1,
+  "max_search_depth": 6,
+  "depth_increase_patience": 30,
+  "depth_threshold_percentile": 50.0,
+  "depth_threshold_warmup": 20,
+  "max_seconds": 0.0,
+  "lr_reduce_patience": 20,
+  "lr_reduce_factor": 0.5,
+  "min_lr": 1e-06,
+  "dirichlet_alpha": 0.3,
+  "dirichlet_epsilon": 0.1,
+  "plot_interval": 5,
+  "device": "cuda"
+}
